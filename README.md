@@ -42,7 +42,7 @@
 1. **Скачивает ядро Mihomo:** проверяет наличие утилит `awg`/`wg` и скачивает актуальный бинарник Mihomo (Clash Meta) под ARM64 в `/usr/bin/mihomo`.
 2. **Поднимает штатный WG-сервер (`wgserver`) и создаёт локального пира:**
    * Если роутер чистый и VPN-сервер ни разу не включался — скрипт сам генерирует ключи, создаёт сервер `wireguard_server.main_server` на порту `51820` с включённой обфускацией AmneziaWG, открывает порт в файрволе и запускает интерфейс `wgserver`. Если сервер уже работает — просто подхватывает его.
-   * Создаёт внутри штатного сервера специального пира `peer_router` (`router-local`) с изолированным адресом `10.1.1.2/32` и сохраняет готовый клиентский конфиг в `/root/router-local.conf` (уже с `Endpoint = 127.0.0.1:51820`, `DNS = 1.1.1.1` и параметрами обфускации сервера).
+   * [Создаёт]([pic-3.png](https://github.com/notmoney-nothoney/Flint2-installer-awg2sub/blob/main/pic-0.png)) внутри штатного сервера специального пира `peer_router` (`router-local`) с изолированным адресом `10.1.1.2/32` и сохраняет готовый клиентский конфиг в `/root/router-local.conf` (уже с `Endpoint = 127.0.0.1:51820`, `DNS = 1.1.1.1` и параметрами обфускации сервера).
 3. **Привязывает подписку к Mihomo (`/etc/mihomo/config.yaml`):**
    * Записывает вашу ссылку подписки в `proxy-providers` (запрашивает её с `User-Agent: clash.meta` и обновляет каждый час).
    * Поднимает виртуальный сетевой интерфейс `utun` и локальный DNS-сервер на порту `1053` (`fake-ip`).
@@ -85,17 +85,13 @@ sh /root/setup_awg_sub.sh "https://your-provider.com/sub/YOUR_TOKEN" --auto
 ## Часть 2. Что делаете вы после запуска скрипта
 
 1. **Для домашних устройств (ПК, телевизор, приставка):**
-   * Откройте в веб-морде GL.iNet **VPN → WireGuard / AmneziaWG Client**.
-   * Найдите автоматически созданную группу **`Mihomo-Sub`** с профилем **`router-local`** и просто нажмите **Start** (вручную ничего копировать и вставлять не нужно; при необходимости резервный файл лежит в `/root/router-local.conf`).
-   * В стандартном разделе **VPN Dashboard** назначьте этот туннель нужным домашним устройствам или сайтам.
-   * Или готовый конфиг командой:
-
-     ```bash
-     cat /root/router-local.conf
-     ```
+   * В веб-морде GL.iNet зайдите в **VPN Dashboard**, создайте новый туннель ([pic-3](https://github.com/notmoney-nothoney/Flint2-installer-awg2sub/blob/main/pic-3.png)) с настройками ([pic-4](https://github.com/notmoney-nothoney/Flint2-installer-awg2sub/blob/main/pic-4.png)): Specified Connection Types — "WireGuard Server", Select Target Destination — "All Targets".
+   * Найдите автоматически созданную группу **`Mihomo-Sub`** с профилем **`router-local`** и выберите её. Включите туннель и не выключайте его, потому что сломается мост с Mihomo!!!!
+   * Теперь можете выбирать `router-local` в своих других туннелях ([pic-1](https://github.com/notmoney-nothoney/Flint2-installer-awg2sub/blob/main/pic-1.png)) — и всё заработает.
 
 2. **Для телефона и ноутбука вне дома:**
-   * В веб-морде GL.iNet зайдите в **VPN → WireGuard / AmneziaWG Server → Profiles**, создайте обычный профиль (или возьмите уже созданный) и сканируйте QR-код в приложении **AmneziaWG**. Весь трафик с телефона сразу пойдёт в подписку (пир `router-local` в списке сервера не трогайте — он зарезервирован для самого роутера).
+   * В веб-морде GL.iNet зайдите в **VPN → WireGuard / AmneziaWG Server → Profiles**, создайте обычный профиль (или возьмите уже созданный) и отсканируйте QR-код в приложении **AmneziaWG**. Весь трафик с телефона сразу пойдёт в подписку (пир `router-local` в списке сервера не трогайте — он зарезервирован для самого роутера). Лайфхак от меня: открываем созданный `.conf` и меняем IP подключения на свой домен — например, у меня крутится DuckDNS. По итогу в Amnezia идёт подключение по домену, а за ним стоит ваш домашний динамический белый IP.
+
 3. **Веб-панель мониторинга Mihomo:**
    * Для просмотра трафика или ручного выбора локации откройте в браузере (сразу привязывается к IP роутера):
 
@@ -207,19 +203,15 @@ sh /root/setup_awg_sub.sh "https://your-provider.com/sub/YOUR_TOKEN" --auto
 ## Part 2. What you do after running the script
 
 1. **For home devices (PC, TV, set-top box):**
-   * Open **VPN → WireGuard / AmneziaWG Client** in the GL.iNet web UI.
-   * Find the automatically created group **`Mihomo-Sub`** with the profile **`router-local`** and just click **Start** (nothing to copy or paste manually; a backup file is available at `/root/router-local.conf` if needed).
-   * In the standard **VPN Dashboard**, assign this tunnel to the desired home devices or sites.
-   * Or get the ready config with:
+   * In the GL.iNet web UI, go to the **VPN Dashboard** and create a new tunnel ([pic-3](https://github.com/notmoney-nothoney/Flint2-installer-awg2sub/blob/main/pic-3.png)) with the following settings ([pic-4](https://github.com/notmoney-nothoney/Flint2-installer-awg2sub/blob/main/pic-4.png)): Specified Connection Types — "WireGuard Server", Select Target Destination — "All Targets".
+   * Find the automatically created group **`Mihomo-Sub`** with the **`router-local`** profile and select it. Enable the tunnel and never turn it off, because that will break the bridge with Mihomo!!!!
+   * Now you can select `router-local` in your other tunnels ([pic-1](https://github.com/notmoney-nothoney/Flint2-installer-awg2sub/blob/main/pic-1.png)), and everything will work.
 
-     ```bash
-     cat /root/router-local.conf
-     ```
+2. **For your phone and laptop outside the home:**
+   * In the GL.iNet web UI, go to **VPN → WireGuard / AmneziaWG Server → Profiles**, create a regular profile (or use an already existing one), and scan the QR code in the **AmneziaWG** app. All traffic from your phone will immediately go through the subscription (don't touch the `router-local` peer in the server's peer list — it's reserved for the router itself). A lifehack from me: open the generated `.conf` file and replace the connection IP with your own domain — for example, I run DuckDNS. As a result, Amnezia connects via the domain, which points to your home dynamic public IP.
 
-2. **For phone and laptop outside home:**
-   * In the GL.iNet web UI go to **VPN → WireGuard / AmneziaWG Server → Profiles**, create a regular profile (or use an existing one), and scan the QR code in the **AmneziaWG** app. All phone traffic will immediately go into the subscription (don't touch the `router-local` peer in the server list — it's reserved for the router itself).
 3. **Mihomo monitoring web panel:**
-   * To view traffic or manually choose a location, open in your browser (it's bound to the router's IP automatically):
+   * To view traffic or manually select a location, open this in your browser (it binds to the router's IP right away):
 
      ```
      http://192.168.0.1:9090/ui/ or http://192.168.0.1:9090/ui/?hostname=192.168.0.1&port=9090
