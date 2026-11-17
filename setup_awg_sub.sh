@@ -1,4 +1,9 @@
 #!/bin/sh
+# =============================================================================
+# setup_awg_sub.sh — AmneziaWG + Mihomo (Clash Meta) + штатный WG сервер GL.iNet
+# Схема: ПК/ТВ → штатный WG сервер → peer_router (10.1.1.2) → utun (Mihomo) → подписка
+# GL.iNet морда НЕ трогается. Все правила через UCI + hotplug.
+# =============================================================================
 
 SUB_URL="$1"
 AUTO_MODE="$2"
@@ -21,7 +26,9 @@ pause_step() {
     fi
 }
 
+# =============================================================================
 echo "[1/6] Checking tools and Mihomo binary..."
+# =============================================================================
 AWG_BIN=$(command -v awg || command -v wg)
 if [ -z "$AWG_BIN" ]; then
     echo "ERROR: 'awg' or 'wg' tool not found."
@@ -38,13 +45,15 @@ if [ ! -x /usr/bin/mihomo ]; then
     curl -fL "$URL" -o /tmp/mihomo.gz && gunzip -f /tmp/mihomo.gz && mv /tmp/mihomo /usr/bin/mihomo && chmod +x /usr/bin/mihomo
 fi
 
+# =============================================================================
 echo "[2/6] Configuring built-in GL.iNet wgserver, peer_router and VPN Client profile..."
+# =============================================================================
 touch /etc/config/wireguard_server
+
 if ! uci -q get wireguard_server.main_server >/dev/null 2>&1; then
     echo "Fresh router detected: creating wireguard_server.main_server..."
     SRV_PRIV=$($AWG_BIN genkey)
     SRV_PUB=$(echo "$SRV_PRIV" | $AWG_BIN pubkey)
-
     uci set wireguard_server.main_server='servers'
     uci set wireguard_server.main_server.address_v4='10.1.0.1/24'
     uci set wireguard_server.main_server.port='51820'
@@ -99,6 +108,7 @@ uci set network.wgserver.disabled='0'
 uci commit network
 
 WGS_PORT=$(uci -q get wireguard_server.main_server.port || echo "51820")
+
 FW_CHANGED=0
 if ! uci -q get firewall.wgserver >/dev/null 2>&1; then
     uci set firewall.wgserver='zone'
@@ -139,6 +149,7 @@ if ! uci -q get firewall.wgserver2lan >/dev/null 2>&1; then
     uci set firewall.wgserver2lan.enabled='1'
     FW_CHANGED=1
 fi
+
 if [ "$FW_CHANGED" -eq 1 ]; then
     uci commit firewall
     /etc/init.d/firewall reload 2>/dev/null
@@ -179,7 +190,6 @@ Address = 10.1.1.2/32
 DNS = 1.1.1.1
 MTU = 1340
 $OBFUSCATION_LINES
-
 [Peer]
 PublicKey = $SRV_PUB
 Endpoint = 127.0.0.1:${WGS_PORT}
@@ -243,12 +253,14 @@ echo "  Client UI:    Mihomo-Sub / router-local (added)"
 echo "  Backup Conf:  /root/router-local.conf"
 echo "  Split Rules:  RU & Private -> DIRECT"
 echo "------------------------------------------"
-
 pause_step "Check summary above"
 
+# =============================================================================
 echo "[3/6] Writing $MIHOMO_DIR/config.yaml..."
+# =============================================================================
 mkdir -p "$MIHOMO_DIR"
 rm -f "$MIHOMO_DIR/GeoIP.dat" "$MIHOMO_DIR/GeoSite.dat"
+
 cat << YAML > "$MIHOMO_DIR/config.yaml"
 mixed-port: 7890
 allow-lan: true
@@ -258,21 +270,18 @@ external-controller: 0.0.0.0:9090
 external-ui: ui
 interface-name: $WAN_IFACE
 routing-mark: 32768
-
 geodata-mode: true
 geo-auto-update: true
 geo-update-interval: 168
 geox-url:
   geoip: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat"
   geosite: "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat"
-
 tun:
   enable: true
   stack: gvisor
   device: utun
   auto-route: false
   auto-detect-interface: false
-
 dns:
   enable: true
   listen: 0.0.0.0:1053
@@ -285,7 +294,6 @@ dns:
     "geosite:category-ru":
       - 77.88.8.8
       - 1.1.1.1
-
 proxy-providers:
   sub:
     type: http
@@ -299,7 +307,6 @@ proxy-providers:
       enable: true
       url: http://www.gstatic.com/generate_204
       interval: 300
-
 proxy-groups:
   - name: PROXY
     type: url-test
@@ -309,7 +316,6 @@ proxy-groups:
     exclude-filter: "(?i)(трафик|остаток|сброс|подписк|expire|traffic|reset|GB|ГБ)"
     use:
       - sub
-
 rules:
   - GEOIP,PRIVATE,DIRECT,no-resolve
   - GEOSITE,category-ru,DIRECT
@@ -320,7 +326,11 @@ rules:
   - MATCH,PROXY
 YAML
 
-echo "[4/6] Configuring Mihomo service, sysctl and firewall..."
+# =============================================================================
+echo "[4/6] Configuring Mihomo service, sysctl, firewall (UCI + hotplug)..."
+# =============================================================================
+
+# --- SYSCTL ---
 sysctl -w net.ipv4.conf.all.accept_local=1 >/dev/null 2>&1
 sysctl -w net.ipv4.conf.default.accept_local=1 >/dev/null 2>&1
 sysctl -w net.ipv4.conf.lo.accept_local=1 >/dev/null 2>&1
@@ -337,12 +347,15 @@ cat << SYSCTL >> /etc/sysctl.conf
 net.ipv4.conf.all.accept_local=1
 net.ipv4.conf.default.accept_local=1
 net.ipv4.conf.lo.accept_local=1
+net.ipv4.conf.wgserver.accept_local=1
 net.ipv4.conf.all.rp_filter=0
 net.ipv4.conf.default.rp_filter=0
 net.ipv4.conf.lo.rp_filter=0
+net.ipv4.conf.wgserver.rp_filter=0
 # END AWG_SUB_SYSCTL
 SYSCTL
 
+# --- INIT.D MIHOMO (с fwmark для исключения петли) ---
 cat << 'INIT_MIHOMO' > /etc/init.d/mihomo
 #!/bin/sh /etc/rc.common
 START=95
@@ -356,15 +369,20 @@ start_service() {
     procd_set_param stdout 1
     procd_set_param stderr 1
     procd_close_instance
-
     (
         i=0
         while [ $i -lt 60 ]; do
             if ip link show utun >/dev/null 2>&1; then
                 ip link set up dev utun
+                # fwmark 32768 — трафик от Mihomo идёт в main, а не в таблицу 200 (петли нет)
+                ip rule del fwmark 32768 2>/dev/null
+                ip rule add fwmark 32768 lookup main priority 40
+                # Основной маршрут через utun
                 ip route replace default dev utun table 200
+                # Маршрут для peer_router (чтобы пакеты возвращались)
                 ip route replace 10.1.1.2/32 dev wgserver 2>/dev/null
                 ip route replace 10.1.1.2/32 dev wgserver table 9910 2>/dev/null
+                # Правило: iif wgserver → таблица 200 (приоритет 50 — НИЖЕ, чем fwmark 40)
                 ip rule del iif wgserver lookup 200 2>/dev/null
                 ip rule add iif wgserver lookup 200 priority 50
                 sysctl -w net.ipv4.conf.wgserver.accept_local=1 >/dev/null 2>&1
@@ -378,6 +396,7 @@ start_service() {
 }
 
 stop_service() {
+    ip rule del fwmark 32768 2>/dev/null
     ip rule del iif wgserver lookup 200 2>/dev/null
     ip route del 10.1.1.2/32 dev wgserver 2>/dev/null
     ip route del 10.1.1.2/32 dev wgserver table 9910 2>/dev/null
@@ -386,9 +405,104 @@ stop_service() {
 INIT_MIHOMO
 chmod +x /etc/init.d/mihomo
 /etc/init.d/mihomo enable
-rm -f "$MIHOMO_DIR/sub.yaml" "$MIHOMO_DIR/happ_sub.yaml"
-/etc/init.d/mihomo restart 2>/dev/null
 
+# --- UCI FIREWALL: собственные именованные секции (GL.iNet НЕ трогает) ---
+
+# 1. Исключаем wgserver из mangle OUTPUT (предотвращаем конфликт с vpn_policy GL.iNet)
+if ! uci -q get firewall.awg_sub_mangle_out >/dev/null 2>&1; then
+    uci add firewall rule
+    uci set firewall.@rule[-1].name='awg_sub_mangle_out'
+    uci set firewall.@rule[-1].src='*'
+    uci set firewall.@rule[-1].proto='all'
+    uci set firewall.@rule[-1].outbound='wgserver'
+    uci set firewall.@rule[-1].target='RETURN'
+    uci set firewall.@rule[-1].extra='-t mangle -A OUTPUT'
+    uci set firewall.@rule[-1].enabled='1'
+    uci rename firewall.@rule[-1]='awg_sub_mangle_out'
+fi
+
+# 2. Исключаем wgserver из mangle PREROUTING
+if ! uci -q get firewall.awg_sub_mangle_pre >/dev/null 2>&1; then
+    uci add firewall rule
+    uci set firewall.@rule[-1].name='awg_sub_mangle_pre'
+    uci set firewall.@rule[-1].src='*'
+    uci set firewall.@rule[-1].proto='all'
+    uci set firewall.@rule[-1].inbound='wgserver'
+    uci set firewall.@rule[-1].target='RETURN'
+    uci set firewall.@rule[-1].extra='-t mangle -A PREROUTING'
+    uci set firewall.@rule[-1].enabled='1'
+    uci rename firewall.@rule[-1]='awg_sub_mangle_pre'
+fi
+
+# 3. FORWARD: wgserver → wan (чтобы пакеты вообще ходили)
+if ! uci -q get firewall.awg_sub_fwd >/dev/null 2>&1; then
+    uci add firewall forwarding
+    uci set firewall.@forwarding[-1].name='awg_sub_fwd'
+    uci set firewall.@forwarding[-1].src='wgserver'
+    uci set firewall.@forwarding[-1].dest='wan'
+    uci set firewall.@forwarding[-1].enabled='1'
+    uci rename firewall.@forwarding[-1]='awg_sub_fwd'
+fi
+
+# 4. MSS Fix
+if ! uci -q get firewall.awg_sub_mss >/dev/null 2>&1; then
+    uci add firewall rule
+    uci set firewall.@rule[-1].name='awg_sub_mss'
+    uci set firewall.@rule[-1].proto='tcp'
+    uci set firewall.@rule[-1].tcp_flags='SYN,RST/SYN'
+    uci set firewall.@rule[-1].target='MSSFIX'
+    uci set firewall.@rule[-1].enabled='1'
+    uci rename firewall.@rule[-1]='awg_sub_mss'
+fi
+
+# 5. DNS перехват wgserver → Mihomo (UDP)
+if ! uci -q get firewall.awg_sub_dns_udp >/dev/null 2>&1; then
+    uci add firewall redirect
+    uci set firewall.@redirect[-1].name='awg_sub_dns_udp'
+    uci set firewall.@redirect[-1].src='wgserver'
+    uci set firewall.@redirect[-1].proto='udp'
+    uci set firewall.@redirect[-1].src_dport='53'
+    uci set firewall.@redirect[-1].dest_port='1053'
+    uci set firewall.@redirect[-1].target='DNAT'
+    uci set firewall.@redirect[-1].enabled='1'
+    uci rename firewall.@redirect[-1]='awg_sub_dns_udp'
+fi
+
+# 6. DNS перехват wgserver → Mihomo (TCP)
+if ! uci -q get firewall.awg_sub_dns_tcp >/dev/null 2>&1; then
+    uci add firewall redirect
+    uci set firewall.@redirect[-1].name='awg_sub_dns_tcp'
+    uci set firewall.@redirect[-1].src='wgserver'
+    uci set firewall.@redirect[-1].proto='tcp'
+    uci set firewall.@redirect[-1].src_dport='53'
+    uci set firewall.@redirect[-1].dest_port='1053'
+    uci set firewall.@redirect[-1].target='DNAT'
+    uci set firewall.@redirect[-1].enabled='1'
+    uci rename firewall.@redirect[-1]='awg_sub_dns_tcp'
+fi
+
+uci commit firewall
+
+# --- UCI NETWORK: маршруты и правила (GL.iNet НЕ трогает) ---
+if ! uci -q get network.awg_sub_rt >/dev/null 2>&1; then
+    uci add network route
+    uci set network.@route[-1].interface='wgserver'
+    uci set network.@route[-1].target='0.0.0.0/0'
+    uci set network.@route[-1].table='200'
+    uci rename network.@route[-1]='awg_sub_rt'
+fi
+
+if ! uci -q get network.awg_sub_rule >/dev/null 2>&1; then
+    uci add network rule
+    uci set network.@rule[-1].in='wgserver'
+    uci set network.@rule[-1].lookup='200'
+    uci set network.@rule[-1].priority='50'
+    uci rename network.@rule[-1]='awg_sub_rule'
+fi
+
+uci commit network
+
+# --- /etc/firewall.user (применяется при старте firewall) ---
 touch /etc/firewall.user
 sed -i '/# BEGIN AWG_SUB_RULES/,/# END AWG_SUB_RULES/d' /etc/firewall.user
 cat << FW >> /etc/firewall.user
@@ -403,7 +517,54 @@ iptables -t nat -C POSTROUTING -o utun -j MASQUERADE 2>/dev/null || iptables -t 
 iptables -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -I FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 # END AWG_SUB_RULES
 FW
-sh /etc/firewall.user
+
+# --- HOTPLUG ХУК: восстанавливает порядок правил ПОСЛЕ любого reload firewall ---
+# GL.iNet НЕ трогает /etc/hotplug.d/iface/ — это перманентное решение
+mkdir -p /etc/hotplug.d/iface
+cat << 'HOTPLUG' > /etc/hotplug.d/iface/99-awg-sub-restore
+#!/bin/sh
+# Срабатывает ПОСЛЕ любого reload firewall (включая переключение фильтрации в морде GL.iNet)
+[ "$ACTION" = "ifup" ] || exit 0
+
+# Ждём, пока fw3 полностью отработает
+sleep 2
+
+# === Восстанавливаем порядок правил в mangle (GL.iNet вставляет свои в начало) ===
+# Исключаем wgserver из mangle OUTPUT — ВСТАВЛЯЕМ В САМОЕ НАЧАЛО (позиция 1)
+iptables -t mangle -D OUTPUT -o wgserver -j RETURN 2>/dev/null
+iptables -t mangle -I OUTPUT 1 -o wgserver -j RETURN 2>/dev/null
+
+# Исключаем wgserver из mangle PREROUTING
+iptables -t mangle -D PREROUTING -i wgserver -j RETURN 2>/dev/null
+iptables -t mangle -I PREROUTING 1 -i wgserver -j RETURN 2>/dev/null
+
+# === Маршруты для peer_router ===
+ip route replace 10.1.1.2/32 dev wgserver 2>/dev/null
+ip route replace 10.1.1.2/32 dev wgserver table 9910 2>/dev/null
+
+# === fwmark для Mihomo (исключаем из петли) ===
+ip rule del fwmark 32768 2>/dev/null
+ip rule add fwmark 32768 lookup main priority 40 2>/dev/null
+
+# === FORWARD правила ===
+iptables -C FORWARD -i wgserver -o utun -j ACCEPT 2>/dev/null || \
+    iptables -I FORWARD -i wgserver -o utun -j ACCEPT 2>/dev/null
+iptables -C FORWARD -i utun -o wgserver -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+    iptables -I FORWARD -i utun -o wgserver -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
+
+# === NAT ===
+iptables -t nat -C POSTROUTING -o utun -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -I POSTROUTING -o utun -j MASQUERADE 2>/dev/null
+HOTPLUG
+chmod +x /etc/hotplug.d/iface/99-awg-sub-restore
+
+# --- Применяем всё ---
+/etc/init.d/network restart
+/etc/init.d/firewall reload
+
+# Запускаем Mihomo
+rm -f "$MIHOMO_DIR/sub.yaml" "$MIHOMO_DIR/happ_sub.yaml"
+/etc/init.d/mihomo restart 2>/dev/null
 
 echo "Waiting for Mihomo to download GeoIP/GeoSite databases and bring up utun..."
 i=0
@@ -412,6 +573,9 @@ while [ $i -lt 30 ]; do
     sleep 1
     i=$((i + 1))
 done
+
+# Принудительно вызываем hotplug для применения правил прямо сейчас
+sh /etc/hotplug.d/iface/99-awg-sub-restore ACTION=ifup INTERFACE=wgserver 2>/dev/null
 
 UTUN_STATE=$(ip link show utun 2>/dev/null | grep -q "UP" && echo "UP" || echo "DOWN")
 TBL200=$(ip route show table 200 | head -n 1)
@@ -423,7 +587,9 @@ echo "  Table 200:  ${TBL200:-EMPTY}"
 echo "  Proxy IP:   ${PROXY_IP:-CHECKING...}"
 echo "------------------------------------------"
 
+# =============================================================================
 echo "[5/6] Web UI setup..."
+# =============================================================================
 if [ "$AUTO_MODE" = "--auto" ]; then
     UI_ANS="y"
 else
@@ -451,7 +617,9 @@ case "$UI_ANS" in
         ;;
 esac
 
+# =============================================================================
 echo "[6/6] Firmware upgrade persistence (/etc/sysupgrade.conf)..."
+# =============================================================================
 if [ "$AUTO_MODE" = "--auto" ]; then
     KEEP_ANS="y"
 else
@@ -468,6 +636,7 @@ case "$KEEP_ANS" in
             "/etc/init.d/mihomo" \
             "/etc/firewall.user" \
             "/etc/sysctl.conf" \
+            "/etc/hotplug.d/iface/99-awg-sub-restore" \
             "/usr/bin/mihomo"
         do
             grep -qxF "$item" /etc/sysupgrade.conf 2>/dev/null || echo "$item" >> /etc/sysupgrade.conf
@@ -483,5 +652,14 @@ esac
 rm -f "$0" /root/setup_awg_sub.sh
 
 echo ""
-echo "DONE! Installer cleaned up. Open GL.iNet Admin Panel -> VPN -> WireGuard / AmneziaWG Client"
-echo "and start the newly created 'Mihomo-Sub / router-local' profile!"
+echo "DONE! Installer cleaned up."
+echo ""
+echo "Next steps:"
+echo "  1. Open GL.iNet Admin Panel -> VPN -> WireGuard / AmneziaWG Client"
+echo "  2. Start the 'Mihomo-Sub / router-local' profile"
+echo "  3. Check Web UI: http://${LAN_IP}:9090/ui/"
+echo ""
+echo "Verification commands:"
+echo "  ip rule show                          # 40: fwmark 32768 lookup main, 50: iif wgserver lookup 200"
+echo "  iptables -t mangle -L OUTPUT -n -v    # Первое правило: RETURN all -- * wgserver"
+echo "  curl -x http://127.0.0.1:7890 https://api.ipify.org  # IP сервера из подписки"
