@@ -1,167 +1,351 @@
 #!/bin/sh
 # =============================================================================
-# uninstall_awg_sub.sh — Полное удаление всех компонентов awg2sub
-# Удаляет: Mihomo, UCI firewall/network секции, hotplug, routing, peer_router
+# uninstall_awg_sub.sh — полный откат setup_awg_sub.sh
+#
+# Удаляет всё, что добавил installer:
+#   - Mihomo (бинарник, конфиг, init-скрипт, WebUI)
+#   - peer_router, peer_9901, group_9901 (WireGuard-профиль в морде)
+#   - UCI: network.utun / awg_sub_*, firewall.utun / awg_sub_*
+#   - sysctl-блок AWG_SUB_SYSCTL
+#   - legacy: /etc/firewall.user AWG_SUB_RULES, hotplug 99-awg-sub-restore
+#   - kernel: ip rules/routes/iptables/utun
+#
+# НЕ трогает: GL.iNet штатное — wgserver, wgclient1, awg1, wgclient2,
+#             iptables LOCAL_POLICY / VPN_PREROUTING_HOOK / TUNNEL*,
+#             ipset, fwmark-правила 0x8000, таблицы 9910/1001/1002/16800.
+#
+# Usage: sh uninstall_awg_sub.sh [--yes] [--full] [--help]
+#   --yes,  -y   без вопросов (для automation)
+#   --full       также удалить wireguard_server.main_server (stock WG-сервер)
+#   --help, -h   справка
 # =============================================================================
 
-FORCE_MODE="$1"
-
-if [ "$FORCE_MODE" != "--force" ]; then
-    printf "Remove Mihomo, UCI rules, routing, peer_router, VPN client profile and all installer files? (y/n): "
-    read -r ans
-    case "$ans" in
-        y|Y|yes|YES|д|Д) ;;
-        *)
-            echo "Aborted."
+YES=0
+FULL=0
+for arg in "$@"; do
+    case "$arg" in
+        --yes|-y)  YES=1 ;;
+        --full)    FULL=1 ;;
+        --help|-h)
+            sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
     esac
-fi
+done
+
+ask() {
+    if [ "$YES" = "1" ]; then return 0; fi
+    printf "%s (y/N): " "$1"
+    read -r ans
+    case "$ans" in
+        y|Y|yes|YES|д|Д) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 # =============================================================================
-echo "[1/7] Stopping and disabling Mihomo service..."
+echo "=========================================================="
+echo "  ROLLBACK: AmneziaWG + Mihomo + peer_router"
+echo "=========================================================="
+echo ""
+echo "WILL REMOVE:"
+echo "  files:  /usr/bin/mihomo, /etc/mihomo/, /etc/init.d/mihomo"
+echo "          /root/router-local.conf"
+echo "  UCI:    network.utun, network.awg_sub_*"
+echo "          firewall.utun, firewall.awg_sub_*"
+echo "          wireguard_server.peer_router"
+echo "          wireguard.peer_9901, wireguard.group_9901"
+echo "  legacy: /etc/firewall.user AWG_SUB_RULES block"
+echo "          /etc/hotplug.d/iface/99-awg-sub-restore"
+echo "  sysctl: block AWG_SUB_SYSCTL"
+echo "  kernel: ip rules iif wgserver → 200, routes table 200,"
+echo "          utun interface, iptables RETURN/REDIRECT/MASQUERADE for wgserver↔utun"
+[ "$FULL" = "1" ] && echo "  FULL:   wireguard_server.main_server + network.wgserver + firewall.wgserver*"
+echo ""
+echo "WILL KEEP (GL.iNet stock):"
+echo "  wgserver, wgclient1, wgclient2, awg1"
+echo "  LOCAL_POLICY / VPN_PREROUTING_HOOK / TUNNEL* / ipset / fwmark 0x8000"
+echo "  таблицы 9910 / 1001 / 1002 / 16800"
+echo "=========================================================="
+echo ""
+
+if ! ask "Proceed with rollback?"; then echo "Aborted."; exit 0; fi
+
 # =============================================================================
-if [ -f /etc/init.d/mihomo ]; then
+# 0. Бэкап текущего состояния в /tmp (перед изменениями)
+# =============================================================================
+echo "[0/8] Backing up current state to /tmp/awg_uninstall_backup/..."
+BK="/tmp/awg_uninstall_backup"
+mkdir -p "$BK"
+ip rule show    > "$BK/ip_rule.txt"   2>/dev/null
+ip route show   > "$BK/ip_route.txt"  2>/dev/null
+ip route show table 200 > "$BK/rt200.txt" 2>/dev/null
+iptables-save   > "$BK/iptables.txt"  2>/dev/null
+ip6tables-save  > "$BK/ip6tables.txt" 2>/dev/null
+uci export network          > "$BK/uci_network.txt"          2>/dev/null
+uci export firewall         > "$BK/uci_firewall.txt"         2>/dev/null
+uci export wireguard        > "$BK/uci_wireguard.txt"        2>/dev/null
+uci export wireguard_server > "$BK/uci_wireguard_server.txt" 2>/dev/null
+[ -f /etc/sysctl.conf ]        && cp /etc/sysctl.conf        "$BK/" 2>/dev/null
+[ -f /etc/sysupgrade.conf ]    && cp /etc/sysupgrade.conf    "$BK/" 2>/dev/null
+[ -f /etc/firewall.user ]      && cp /etc/firewall.user      "$BK/" 2>/dev/null
+echo "  backup dir: $BK"
+
+# =============================================================================
+# 1. Останавливаем и убиваем Mihomo
+# =============================================================================
+echo "[1/8] Stopping Mihomo..."
+if [ -x /etc/init.d/mihomo ]; then
     /etc/init.d/mihomo stop 2>/dev/null
     /etc/init.d/mihomo disable 2>/dev/null
-    rm -f /etc/init.d/mihomo
 fi
-killall mihomo 2>/dev/null
+pkill -x mihomo 2>/dev/null
+sleep 1
+pkill -9 -x mihomo 2>/dev/null
+# Убедиться что процесс мёртв
+if pgrep -x mihomo >/dev/null 2>&1; then
+    echo "  WARNING: mihomo still running, sending SIGKILL..."
+    kill -9 $(pgrep -x mihomo) 2>/dev/null
+    sleep 1
+fi
+echo "  mihomo stopped"
 
 # =============================================================================
-echo "[2/7] Cleaning ip rules and routing tables..."
+# 2. Удаляем файлы Mihomo
 # =============================================================================
-# Удаляем fwmark правило для Mihomo (исключение из петли)
-ip rule del fwmark 32768 2>/dev/null
-
-# Удаляем правило iif wgserver → таблица 200
-ip rule del iif wgserver lookup 200 2>/dev/null
-
-# Удаляем маршруты для peer_router
-ip route del 10.1.1.2/32 dev wgserver 2>/dev/null
-ip route del 10.1.1.2/32 dev wgserver table 9910 2>/dev/null
-
-# Очищаем таблицу 200
-ip route flush table 200 2>/dev/null
+echo "[2/8] Removing Mihomo files..."
+rm -f /etc/init.d/mihomo
+rm -f /usr/bin/mihomo
+rm -rf /etc/mihomo
+rm -f /root/router-local.conf
+# Подчистим возможные временные
+rm -f /tmp/mihomo /tmp/mihomo.gz /tmp/ui.tgz
+echo "  done"
 
 # =============================================================================
-echo "[3/7] Cleaning UCI firewall rules (awg_sub_*)..."
+# 3. Удаляем legacy-артефакты (firewall.user + hotplug)
 # =============================================================================
-# Удаляем именованные UCI секции firewall (GL.iNet их не трогает, но мы удаляем)
-for section in awg_sub_mangle_out awg_sub_mangle_pre awg_sub_fwd awg_sub_mss awg_sub_dns_udp awg_sub_dns_tcp; do
-    if uci -q get firewall.${section} >/dev/null 2>&1; then
-        uci delete firewall.${section}
-    fi
-done
-uci commit firewall 2>/dev/null
-
-# =============================================================================
-echo "[4/7] Cleaning UCI network rules (awg_sub_*)..."
-# =============================================================================
-for section in awg_sub_rt awg_sub_rule; do
-    if uci -q get network.${section} >/dev/null 2>&1; then
-        uci delete network.${section}
-    fi
-done
-uci commit network 2>/dev/null
-
-# =============================================================================
-echo "[5/7] Cleaning firewall.user, mangle rules and sysctl..."
-# =============================================================================
-# Удаляем блок из /etc/firewall.user
+echo "[3/8] Removing legacy artifacts..."
 if [ -f /etc/firewall.user ]; then
     sed -i '/# BEGIN AWG_SUB_RULES/,/# END AWG_SUB_RULES/d' /etc/firewall.user
+    echo "  - firewall.user AWG_SUB_RULES block"
+fi
+if [ -f /etc/hotplug.d/iface/99-awg-sub-restore ]; then
+    rm -f /etc/hotplug.d/iface/99-awg-sub-restore
+    echo "  - hotplug 99-awg-sub-restore"
 fi
 
-# Удаляем mangle правила (исключения wgserver из политик GL.iNet)
-iptables -t mangle -D OUTPUT -o wgserver -j RETURN 2>/dev/null
-iptables -t mangle -D PREROUTING -i wgserver -j RETURN 2>/dev/null
-
-# Удаляем FORWARD правила
-iptables -D FORWARD -i wgserver -o utun -j ACCEPT 2>/dev/null
-iptables -D FORWARD -i utun -o wgserver -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
-iptables -D FORWARD -i utun -o wgserver -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
-
-# Удаляем NAT правила
-iptables -t nat -D PREROUTING -i wgserver -p udp --dport 53 -j REDIRECT --to-ports 1053 2>/dev/null
-iptables -t nat -D PREROUTING -i wgserver -p tcp --dport 53 -j REDIRECT --to-ports 1053 2>/dev/null
-iptables -t nat -D POSTROUTING -o utun -j MASQUERADE 2>/dev/null
-
-# Удаляем MSS Fix
-iptables -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
-
-# Удаляем блок из /etc/sysctl.conf
-if [ -f /etc/sysctl.conf ]; then
+# =============================================================================
+# 4. Удаляем sysctl-блок
+# =============================================================================
+echo "[4/8] Removing sysctl block..."
+if [ -f /etc/sysctl.conf ] && grep -q "# BEGIN AWG_SUB_SYSCTL" /etc/sysctl.conf 2>/dev/null; then
     sed -i '/# BEGIN AWG_SUB_SYSCTL/,/# END AWG_SUB_SYSCTL/d' /etc/sysctl.conf
-    sysctl -p >/dev/null 2>&1
+    sysctl -p /etc/sysctl.conf >/dev/null 2>&1
+    echo "  - AWG_SUB_SYSCTL block removed"
 fi
+# Восстанавливаем rp_filter/accept_local на wgserver в default
+sysctl -w net.ipv4.conf.wgserver.rp_filter=1 >/dev/null 2>&1
+sysctl -w net.ipv4.conf.wgserver.accept_local=0 >/dev/null 2>&1
 
 # =============================================================================
-echo "[6/7] Removing hotplug hook and peer_router..."
+# 5. Удаляем UCI: network
 # =============================================================================
-# Удаляем hotplug хук (восстанавливающий правила после reload firewall)
-rm -f /etc/hotplug.d/iface/99-awg-sub-restore
+echo "[5/8] Removing UCI network sections..."
+for s in \
+    utun \
+    awg_sub_rt_peer \
+    awg_sub_rt_peer_9910 \
+    awg_sub_rt_peer_200 \
+    awg_sub_rt_utun \
+    awg_sub_rule_iif \
+    awg_sub_rule_mark
+do
+    if uci -q get "network.$s" >/dev/null 2>&1; then
+        uci -q delete "network.$s"
+        echo "  - network.$s"
+    fi
+done
 
-# Удаляем peer_router из live kernel interface
-AWG_BIN=$(command -v awg || command -v wg)
-PEER_PUB=$(uci -q get wireguard_server.peer_router.public_key)
-if [ -n "$AWG_BIN" ] && [ -n "$PEER_PUB" ]; then
-    $AWG_BIN set wgserver peer "$PEER_PUB" remove 2>/dev/null
-fi
+# network.wgserver — НЕ трогаем (stock GL.iNet), кроме --full
 
-# Удаляем peer_router из UCI
+# =============================================================================
+# 6. Удаляем UCI: firewall
+# =============================================================================
+echo "[6/8] Removing UCI firewall sections..."
+for s in \
+    utun \
+    awg_sub_fwd_wan \
+    awg_sub_fwd_utun \
+    awg_sub_fwd_ret \
+    awg_sub_mangle_pre \
+    awg_sub_mangle_out \
+    awg_sub_mss \
+    awg_sub_dns_udp \
+    awg_sub_dns_tcp
+do
+    if uci -q get "firewall.$s" >/dev/null 2>&1; then
+        uci -q delete "firewall.$s"
+        echo "  - firewall.$s"
+    fi
+done
+
+# =============================================================================
+# 7. Удаляем WireGuard-профиль и peer_router
+# =============================================================================
+echo "[7/8] Removing wireguard client profile & peer_router..."
+for s in peer_9901 group_9901; do
+    if uci -q get "wireguard.$s" >/dev/null 2>&1; then
+        uci -q delete "wireguard.$s"
+        echo "  - wireguard.$s"
+    fi
+done
 if uci -q get wireguard_server.peer_router >/dev/null 2>&1; then
-    uci delete wireguard_server.peer_router
-    uci commit wireguard_server
+    uci -q delete wireguard_server.peer_router
+    echo "  - wireguard_server.peer_router"
 fi
 
-# Удаляем VPN Client profile из UCI
-uci -q delete wireguard.peer_9901
-uci -q delete wireguard.group_9901
-uci -q delete wireguard.awg2sub_peer
-uci -q delete wireguard.awg2sub
-uci commit wireguard 2>/dev/null
+if [ "$FULL" = "1" ]; then
+    echo ""
+    echo "  --full: также удаляем stock WG-сервер?"
+    if ask "  Remove wireguard_server.main_server + network.wgserver + firewall.wgserver*?"; then
+        for s in main_server; do
+            if uci -q get "wireguard_server.$s" >/dev/null 2>&1; then
+                uci -q delete "wireguard_server.$s"
+                echo "  - wireguard_server.$s"
+            fi
+        done
+        for s in wgserver; do
+            if uci -q get "network.$s" >/dev/null 2>&1; then
+                uci -q delete "network.$s"
+                echo "  - network.$s"
+            fi
+        done
+        for s in wgserver wgserver_allow wgserver2wan wgserver2lan; do
+            if uci -q get "firewall.$s" >/dev/null 2>&1; then
+                uci -q delete "firewall.$s"
+                echo "  - firewall.$s"
+            fi
+        done
+    fi
+fi
+
+uci commit network
+uci commit firewall
+uci commit wireguard
+uci commit wireguard_server
 
 # =============================================================================
-echo "[7/7] Removing files and /etc/sysupgrade.conf entries..."
+# 8. Чистим /etc/sysupgrade.conf
 # =============================================================================
-# Удаляем основные файлы
-rm -rf /etc/mihomo /usr/bin/mihomo /root/router-local.conf
-
-# Удаляем записи из /etc/sysupgrade.conf
+echo "[8/8] Cleaning /etc/sysupgrade.conf..."
 if [ -f /etc/sysupgrade.conf ]; then
     for item in \
-        "/root/setup_awg_sub.sh" \
-        "/root/uninstall_awg_sub.sh" \
         "/root/router-local.conf" \
         "/etc/mihomo" \
         "/etc/init.d/mihomo" \
-        "/etc/firewall.user" \
         "/etc/sysctl.conf" \
-        "/etc/hotplug.d/iface/99-awg-sub-restore" \
-        "/usr/bin/mihomo"
+        "/usr/bin/mihomo" \
+        "/etc/firewall.user" \
+        "/etc/hotplug.d/iface/99-awg-sub-restore"
     do
-        sed -i "\|^${item}$|d" /etc/sysupgrade.conf
+        # экранируем '/' в sed-разделителе через '|'
+        sed -i "\|^${item}$|d" /etc/sysupgrade.conf 2>/dev/null
     done
+    echo "  done"
 fi
 
-# Удаляем сами скрипты установки/удаления
-rm -f /root/setup_awg_sub.sh /root/uninstall_awg_sub.sh
+# =============================================================================
+# Kernel cleanup — вычищаем то, что старое (hotplug/firewall.user) могло оставить,
+# и что не удалится через перезапуск сервисов
+# =============================================================================
+echo ""
+echo "Cleaning kernel state (ip rules/routes/iptables/utun)..."
 
-# Перезапускаем firewall и network для применения изменений
-/etc/init.d/firewall reload 2>/dev/null
-/etc/init.d/network restart 2>/dev/null
+# --- ip rules (только наши) ---
+# iif wgserver → 200 — наш
+while ip rule show | grep -q "from all iif wgserver lookup 200"; do
+    ip rule del iif wgserver lookup 200 2>/dev/null || break
+done
+
+# fwmark 0x8000 — НЕ трогаем, это GL.iNet-территория (приоритет 10/40/6000)
+
+# --- routes ---
+ip route del 10.1.1.2/32 dev wgserver table 200 2>/dev/null
+ip route del default dev utun table 200 2>/dev/null
+ip route del 10.1.1.2/32 dev wgserver table 9910 2>/dev/null
+ip route del 10.1.1.2/32 dev wgserver 2>/dev/null
+
+# --- iptables: legacy leftovers от /etc/firewall.user (while -C защищает от повторов) ---
+clean_rule() {
+    tbl="$1"; chain="$2"; shift 2
+    while iptables -t "$tbl" -C "$chain" "$@" 2>/dev/null; do
+        iptables -t "$tbl" -D "$chain" "$@" 2>/dev/null || break
+    done
+}
+
+clean_rule mangle OUTPUT -o wgserver -j RETURN
+clean_rule mangle PREROUTING -i wgserver -j RETURN
+clean_rule filter FORWARD -i wgserver -o utun -j ACCEPT
+clean_rule filter FORWARD -i utun -o wgserver -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+clean_rule nat PREROUTING -i wgserver -p udp --dport 53 -j REDIRECT --to-ports 1053
+clean_rule nat PREROUTING -i wgserver -p tcp --dport 53 -j REDIRECT --to-ports 1053
+clean_rule nat POSTROUTING -o utun -j MASQUERADE
+
+# --- utun (мог остаться, если mihomo был убит SIGKILL) ---
+if ip link show utun >/dev/null 2>&1; then
+    ip link set utun down 2>/dev/null
+    ip link del utun 2>/dev/null && echo "  - utun interface removed"
+fi
+
+# =============================================================================
+# Финальный reload
+# =============================================================================
+echo ""
+echo "Reloading network and firewall..."
+/etc/init.d/network restart
+sleep 2
+/etc/init.d/firewall reload
+
+# =============================================================================
+# Финальная проверка — что осталось, что ушло
+# =============================================================================
+echo ""
+echo "=========================================================="
+echo "  VERIFY (should all be empty):"
+echo "=========================================================="
+
+check_empty() {
+    out=$(eval "$1" 2>/dev/null)
+    if [ -z "$out" ]; then
+        echo "  OK   $2"
+    else
+        echo "  WARN $2"
+        echo "$out" | sed 's/^/       /'
+    fi
+}
+check_empty "ip rule show | grep 'iif wgserver'"        "no 'iif wgserver' ip rule"
+check_empty "ip route show table 200 | grep -v '^$'"    "table 200 empty"
+check_empty "ip link show utun 2>/dev/null"             "utun interface gone"
+check_empty "pgrep -x mihomo"                           "no mihomo process"
+check_empty "ls /etc/mihomo 2>/dev/null"                "/etc/mihomo removed"
+check_empty "ls /usr/bin/mihomo 2>/dev/null"            "/usr/bin/mihomo removed"
+check_empty "uci -q show network | grep awg_sub"        "no network.awg_sub_*"
+check_empty "uci -q show firewall | grep awg_sub"       "no firewall.awg_sub_*"
+check_empty "uci -q get wireguard.peer_9901"            "no wireguard.peer_9901"
+check_empty "uci -q get wireguard_server.peer_router"   "no wireguard_server.peer_router"
+check_empty "iptables -t mangle -S | grep 'o wgserver.*RETURN'" "no legacy mangle OUTPUT RETURN"
+check_empty "iptables -t mangle -S | grep 'i wgserver.*RETURN'" "no legacy mangle PREROUTING RETURN"
+check_empty "iptables -t nat -S | grep 'to-ports 1053'"         "no legacy dns redirect"
+check_empty "iptables -t nat -S | grep 'o utun.*MASQUERADE'"    "no legacy utun MASQUERADE"
 
 echo ""
-echo "DONE! All awg2sub components have been cleanly removed:"
-echo "  ✓ Mihomo binary and service"
-echo "  ✓ UCI firewall rules (awg_sub_*)"
-echo "  ✓ UCI network rules (awg_sub_*)"
-echo "  ✓ Hotplug hook (99-awg-sub-restore)"
-echo "  ✓ Routing rules and tables"
-echo "  ✓ fwmark rule (32768)"
-echo "  ✓ Mangle rules (wgserver exclusions)"
-echo "  ✓ peer_router and VPN Client profile"
-echo "  ✓ /etc/sysupgrade.conf entries"
+echo "=========================================================="
+echo "  Rollback complete."
+echo "=========================================================="
 echo ""
-echo "Router firewall and network reloaded."
+echo "Stock GL.iNet VPN Dashboard + wgserver still work as before."
+echo "Backup of pre-uninstall state: /tmp/awg_uninstall_backup/"
+echo ""
+echo "If you need to restore the WG server (--full was used):"
+echo "  GL.iNet Admin Panel → VPN → WireGuard Server → start it again"
